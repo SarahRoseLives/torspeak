@@ -1,9 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"os"
@@ -11,6 +11,15 @@ import (
 	"time"
 
 	"github.com/cretz/bine/tor"
+)
+
+// ANSI Color Codes
+const (
+	ColorReset  = "\033[0m"
+	ColorRed    = "\033[31m"
+	ColorGreen  = "\033[32m" // Peer color
+	ColorCyan   = "\033[36m" // Self color
+	ColorGray   = "\033[90m" // System messages
 )
 
 func main() {
@@ -21,17 +30,13 @@ func main() {
 
 	mode := os.Args[1]
 
-	// 1. Start the Tor instance
-	// This will download a static Tor binary if not found, or use the local one.
-	// It takes a few seconds to bootstrap.
-	fmt.Println("Starting Tor (this may take a moment)...")
+	fmt.Printf("%sStarting Tor (this may take a moment)...%s\n", ColorGray, ColorReset)
 	t, err := tor.Start(nil, nil)
 	if err != nil {
 		log.Panicf("Unable to start Tor: %v", err)
 	}
 	defer t.Close()
 
-	// 2. Route based on command
 	switch mode {
 	case "host":
 		runHost(t)
@@ -41,7 +46,6 @@ func main() {
 			printUsage()
 			return
 		}
-		// Clean up address (add port 80 if missing, though we handle logic below)
 		addr := os.Args[2]
 		runClient(t, addr)
 	default:
@@ -56,13 +60,11 @@ func printUsage() {
 }
 
 func runHost(t *tor.Tor) {
-	// Create a context for the listener setup
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
-	fmt.Println("Creating Tor Hidden Service...")
+	fmt.Printf("%sCreating Tor Hidden Service...%s\n", ColorGray, ColorReset)
 
-	// Create an Onion V3 Hidden Service listening on virtual port 80
 	onion, err := t.Listen(ctx, &tor.ListenConf{
 		Version3:    true,
 		RemotePorts: []int{80},
@@ -72,69 +74,89 @@ func runHost(t *tor.Tor) {
 	}
 	defer onion.Close()
 
-	fmt.Printf("\nCheck check. Secure line ready.\n")
+	fmt.Printf("\n%sCheck check. Secure line ready.%s\n", ColorGreen, ColorReset)
 	fmt.Printf("COMMAND: torspeak connect %s.onion\n", onion.ID)
-	fmt.Printf("\nWaiting for peer to connect...\n")
+	fmt.Printf("\n%sWaiting for peer to connect...%s\n", ColorGray, ColorReset)
 
-	// Accept the first incoming connection
 	conn, err := onion.Accept()
 	if err != nil {
 		log.Panicf("Accept failed: %v", err)
 	}
 
-	fmt.Println(">> Peer connected! Start typing.")
+	fmt.Printf("%s>> Peer connected! Start typing.%s\n", ColorGreen, ColorReset)
 	stream(conn)
 }
 
 func runClient(t *tor.Tor, address string) {
-	// Create a context for the dialer
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
-	// Create a Tor dialer
 	dialer, err := t.Dialer(ctx, nil)
 	if err != nil {
 		log.Panicf("Unable to create dialer: %v", err)
 	}
 
-	// Ensure port 80 is attached to the string
 	if !strings.Contains(address, ":") {
 		address = address + ":80"
 	}
 
-	fmt.Printf("Connecting to %s...\n", address)
+	fmt.Printf("%sConnecting to %s...%s\n", ColorGray, address, ColorReset)
 
-	// Connect via Tor
 	conn, err := dialer.Dial("tcp", address)
 	if err != nil {
 		log.Panicf("Failed to connect: %v", err)
 	}
 
-	fmt.Println(">> Connected! Start typing.")
+	fmt.Printf("%s>> Connected! Start typing.%s\n", ColorGreen, ColorReset)
 	stream(conn)
 }
 
-// stream pipes stdin -> conn and conn -> stdout
 func stream(conn net.Conn) {
 	defer conn.Close()
 
 	// Channel to signal when the chat is done
 	done := make(chan struct{})
 
-	// Incoming: Read from socket, print to screen
+	// 1. INCOMING MESSAGES (Peer)
 	go func() {
-		io.Copy(os.Stdout, conn)
-		fmt.Println("\n[Peer disconnected]")
+		scanner := bufio.NewScanner(conn)
+		for scanner.Scan() {
+			msg := scanner.Text()
+			ts := time.Now().Format("15:04")
+			// Format: [Time] <Peer>: Message (in Green)
+			fmt.Printf("\r%s[%s] <Peer>: %s%s\n", ColorGreen, ts, msg, ColorReset)
+
+			// Re-print the prompt cursor so typing looks clean
+			fmt.Print("> ")
+		}
+		fmt.Printf("\n%s[Peer disconnected]%s\n", ColorRed, ColorReset)
 		close(done)
 	}()
 
-	// Outgoing: Read from keyboard, send to socket
+	// 2. OUTGOING MESSAGES (Self)
 	go func() {
-		io.Copy(conn, os.Stdin)
-		// If stdin closes (Ctrl+D), we close the connection
+		scanner := bufio.NewScanner(os.Stdin)
+		fmt.Print("> ") // Initial prompt
+		for scanner.Scan() {
+			msg := scanner.Text()
+
+			// Clear previous line to replace raw input with formatted input
+			// \033[1A moves cursor up, \033[K clears line
+			fmt.Printf("\033[1A\033[K")
+
+			ts := time.Now().Format("15:04")
+
+			// Format: [Time] <Me>: Message (in Cyan)
+			fmt.Printf("%s[%s] <Me>: %s%s\n", ColorCyan, ts, msg, ColorReset)
+
+			// Send raw message to peer (with newline)
+			fmt.Fprintf(conn, "%s\n", msg)
+
+			fmt.Print("> ") // Prompt for next line
+		}
+		// If stdin closes (Ctrl+D), close connection
 		conn.Close()
 	}()
 
-	// Block until the incoming stream ends
 	<-done
 }
